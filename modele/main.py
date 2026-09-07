@@ -1,5 +1,10 @@
 from pathlib import Path
-
+import hashlib
+import logging
+import time
+import uuid
+import numpy as np
+from database import init_database, log_prediction
 import joblib
 import pandas as pd
 import gradio as gr
@@ -21,6 +26,19 @@ MODEL_PATH = (
 OUTPUT_DIR = PROJECT_ROOT / "data"
 OUTPUT_PATH = OUTPUT_DIR / "predictions_credit_scoring.csv"
 
+MODEL_NAME = "random_forest_smote"
+MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
+DECISION_THRESHOLD = float(
+    os.getenv("DECISION_THRESHOLD", "0.5")
+)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # Chargement du modèle
@@ -39,6 +57,109 @@ print(f"Modèle chargé depuis : {MODEL_PATH}")
 # ============================================================
 # Récupération des colonnes attendues
 # ============================================================
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def get_input_summary(df_input: pd.DataFrame) -> dict:
+    """
+    Ne stocke pas les lignes complètes.
+    Conserve uniquement des statistiques agrégées.
+    """
+
+    numeric_df = df_input.select_dtypes(
+        include=["number"]
+    )
+
+    summary = {
+        "missing_values_total": int(df_input.isna().sum().sum()),
+        "missing_values_ratio": float(
+            df_input.isna().mean().mean()
+        ),
+        "numeric_columns": int(numeric_df.shape[1]),
+    }
+
+    return summary
+
+
+def build_event(
+    request_id: str,
+    status: str,
+    latency_ms: float,
+    df_input: pd.DataFrame | None = None,
+    predictions: np.ndarray | None = None,
+    probabilities: np.ndarray | None = None,
+    error: Exception | None = None,
+) -> dict:
+    """
+    Construit un événement cohérent avant insertion en base.
+    """
+
+    if df_input is not None:
+        schema_string = "|".join(df_input.columns.astype(str))
+        input_schema_hash = sha256_text(schema_string)
+        input_rows = int(len(df_input))
+        input_columns = int(df_input.shape[1])
+        input_summary = get_input_summary(df_input)
+    else:
+        input_schema_hash = None
+        input_rows = None
+        input_columns = None
+        input_summary = None
+
+    if predictions is not None:
+        prediction_positive_count = int(
+            (predictions == 1).sum()
+        )
+        prediction_negative_count = int(
+            (predictions == 0).sum()
+        )
+    else:
+        prediction_positive_count = None
+        prediction_negative_count = None
+
+    if probabilities is not None and len(probabilities) > 0:
+        probability_mean = float(np.mean(probabilities))
+        probability_min = float(np.min(probabilities))
+        probability_max = float(np.max(probabilities))
+    else:
+        probability_mean = None
+        probability_min = None
+        probability_max = None
+
+    return {
+        "request_id": request_id,
+        "event_type": "prediction",
+        "status": status,
+
+        "model_name": MODEL_NAME,
+        "model_version": MODEL_VERSION,
+        "model_sha": None,
+
+        "input_rows": input_rows,
+        "input_columns": input_columns,
+        "input_schema_hash": input_schema_hash,
+        "input_file_hash": None,
+
+        "prediction_positive_count": prediction_positive_count,
+        "prediction_negative_count": prediction_negative_count,
+        "probability_mean": probability_mean,
+        "probability_min": probability_min,
+        "probability_max": probability_max,
+        "decision_threshold": DECISION_THRESHOLD,
+
+        "latency_ms": float(latency_ms),
+        "input_summary": input_summary,
+
+        "error_type": type(error).__name__ if error else None,
+        "error_message": (
+            str(error)[:500]
+            if error else None
+        ),
+        "created_by": None,
+    }
 
 def get_expected_features(loaded_model):
     """
@@ -77,104 +198,125 @@ print(f"Nombre de features attendues : {len(EXPECTED_FEATURES)}")
 # ============================================================
 
 def predict_from_csv(csv_file):
-    """
-    Reçoit un fichier CSV depuis Gradio, retourne :
-    - un aperçu des prédictions ;
-    - un message de statut ;
-    - le chemin vers un CSV téléchargeable.
-    """
-
-    if csv_file is None:
-        raise gr.Error("Veuillez importer un fichier CSV.")
+    request_id = str(uuid.uuid4())
+    start_time = time.perf_counter()
+    df_input = None
 
     try:
+        if csv_file is None:
+            raise ValueError("Aucun fichier CSV fourni.")
+
         df_input = pd.read_csv(csv_file)
-    except Exception as exc:
-        raise gr.Error(
-            f"Impossible de lire le CSV : {exc}"
+
+        # Si TARGET est présent, il n'est pas transmis au modèle
+        df_input = df_input.drop(
+            columns=["TARGET"],
+            errors="ignore",
         )
 
-    # Évite une erreur si l'utilisateur envoie aussi TARGET.
-    # La cible n'est jamais une feature de prédiction.
-    df_input = df_input.drop(
-        columns=["TARGET"],
-        errors="ignore",
-    )
+        missing_features = [
+            feature
+            for feature in EXPECTED_FEATURES
+            if feature not in df_input.columns
+        ]
 
-    # Colonnes attendues mais absentes du CSV
-    missing_features = [
-        feature
-        for feature in EXPECTED_FEATURES
-        if feature not in df_input.columns
-    ]
+        if missing_features:
+            preview = ", ".join(missing_features[:10])
 
-    # Colonnes présentes mais non utilisées par le modèle
-    extra_features = [
-        feature
-        for feature in df_input.columns
-        if feature not in EXPECTED_FEATURES
-    ]
+            raise ValueError(
+                f"{len(missing_features)} features manquantes : "
+                f"{preview}"
+            )
 
-    if missing_features:
-        preview = ", ".join(missing_features[:15])
+        # Colonnes dans l'ordre appris pendant l'entraînement
+        X_input = df_input[EXPECTED_FEATURES].copy()
 
-        suffix = (
-            " ..."
-            if len(missing_features) > 15
-            else ""
-        )
-
-        raise gr.Error(
-            f"Le CSV ne contient pas toutes les features attendues. "
-            f"Colonnes manquantes ({len(missing_features)}) : "
-            f"{preview}{suffix}"
-        )
-
-    # Conserver strictement les colonnes attendues,
-    # dans l'ordre appris pendant fit().
-    X_input = df_input[EXPECTED_FEATURES].copy()
-
-    try:
-        predictions = model.predict(X_input)
         probabilities = model.predict_proba(X_input)[:, 1]
+
+        # Recommandé si tu as un seuil métier sauvegardé.
+        predictions = (
+            probabilities >= DECISION_THRESHOLD
+        ).astype(int)
+
+        result_df = df_input.copy()
+        result_df["prediction"] = predictions
+        result_df["probabilite_defaut"] = probabilities.round(4)
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        result_df.to_csv(
+            OUTPUT_PATH,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        event = build_event(
+            request_id=request_id,
+            status="success",
+            latency_ms=latency_ms,
+            df_input=X_input,
+            predictions=predictions,
+            probabilities=probabilities,
+        )
+
+        try:
+            log_prediction(event)
+        except Exception:
+            # La prédiction ne doit pas échouer seulement
+            # parce que le logging est indisponible.
+            logger.exception(
+                "request_id=%s database_logging_failed",
+                request_id,
+            )
+
+        logger.info(
+            "request_id=%s status=success rows=%s latency_ms=%.2f",
+            request_id,
+            len(result_df),
+            latency_ms,
+        )
+
+        status = (
+            f"Prédiction terminée pour {len(result_df)} lignes. "
+            f"request_id={request_id}. "
+            f"Temps : {latency_ms:.2f} ms."
+        )
+
+        return result_df.head(100), status, str(OUTPUT_PATH)
+
     except Exception as exc:
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        event = build_event(
+            request_id=request_id,
+            status="error",
+            latency_ms=latency_ms,
+            df_input=df_input,
+            error=exc,
+        )
+
+        try:
+            log_prediction(event)
+        except Exception:
+            logger.exception(
+                "request_id=%s error_logging_failed",
+                request_id,
+            )
+
+        logger.exception(
+            "request_id=%s status=error",
+            request_id,
+        )
+
         raise gr.Error(
-            f"Erreur pendant la prédiction : {exc}"
+            f"Erreur de prédiction. "
+            f"Identifiant de requête : {request_id}."
         )
-
-    # On conserve toutes les colonnes d'origine et on ajoute les sorties
-    result_df = df_input.copy()
-
-    result_df["prediction"] = predictions.astype(int)
-    result_df["probabilite_defaut"] = probabilities.round(4)
-
-    # Création du dossier artifacts si nécessaire
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Sauvegarde du CSV de résultats
-    result_df.to_csv(
-        OUTPUT_PATH,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    # Message de statut affiché dans Gradio
-    n_rows = len(result_df)
-    n_positive = int((result_df["prediction"] == 1).sum())
-
-    status = (
-        f"Prédictions réalisées pour {n_rows} ligne(s). "
-        f"Classe 1 prédite pour {n_positive} ligne(s)."
-    )
-
-    if extra_features:
-        status += (
-            f" {len(extra_features)} colonne(s) supplémentaire(s) "
-            f"ont été ignorées par le modèle."
-        )
-
-    # Tableau affiché, message, fichier téléchargeable
-    return result_df.head(100), status, str(OUTPUT_PATH)
 
 
 # ============================================================
@@ -223,10 +365,18 @@ with gr.Blocks(title="Credit Scoring - Prédictions CSV") as demo:
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "7860"))
+    try:
+        init_database()
+        logger.info("Base de données de logs prête.")
+    except Exception:
+        # À discuter selon ton besoin :
+        # fail-fast si audit obligatoire, sinon l'application continue.
+        logger.exception(
+            "Impossible d'initialiser la base de logs."
+        )
 
     demo.launch(
         server_name="0.0.0.0",
-        server_port=port,
+        server_port=int(os.getenv("PORT", "7860")),
         share=False,
     )
