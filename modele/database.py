@@ -139,12 +139,17 @@ def log_prediction(event: dict):
 
     event_to_insert = {
         **event,
-        "input_summary": json.dumps(event.get("input_summary", {})),
+        "input_summary": json.dumps(
+            event.get("input_summary", {})
+        ),
     }
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(query, event_to_insert)
+            cursor.execute(
+                query,
+                event_to_insert,
+            )
 
 def log_feature_statistics(records: list[dict]):
     query = """

@@ -10,7 +10,8 @@ import pandas as pd
 import gradio as gr
 import os
 from monitoring import build_feature_statistics
-
+from datetime import datetime, timezone
+import json
 
 # ============================================================
 # Chemins du projet
@@ -94,21 +95,34 @@ def build_event(
     request_id: str,
     status: str,
     latency_ms: float,
+    latency_per_row_ms: float | None = None,
+    input_missing_ratio: float | None = None,
+    output_positive_rate: float | None = None,
     df_input: pd.DataFrame | None = None,
     predictions: np.ndarray | None = None,
     probabilities: np.ndarray | None = None,
     error: Exception | None = None,
 ) -> dict:
     """
-    Construit un événement cohérent avant insertion en base.
+    Construit un événement à insérer dans prediction_logs.
     """
 
     if df_input is not None:
-        schema_string = "|".join(df_input.columns.astype(str))
-        input_schema_hash = sha256_text(schema_string)
+        schema_string = "|".join(
+            df_input.columns.astype(str)
+        )
+
+        input_schema_hash = sha256_text(
+            schema_string
+        )
+
         input_rows = int(len(df_input))
         input_columns = int(df_input.shape[1])
-        input_summary = get_input_summary(df_input)
+
+        input_summary = get_input_summary(
+            df_input
+        )
+
     else:
         input_schema_hash = None
         input_rows = None
@@ -119,17 +133,28 @@ def build_event(
         prediction_positive_count = int(
             (predictions == 1).sum()
         )
+
         prediction_negative_count = int(
             (predictions == 0).sum()
         )
+
     else:
         prediction_positive_count = None
         prediction_negative_count = None
 
     if probabilities is not None and len(probabilities) > 0:
-        probability_mean = float(np.mean(probabilities))
-        probability_min = float(np.min(probabilities))
-        probability_max = float(np.max(probabilities))
+        probability_mean = float(
+            np.mean(probabilities)
+        )
+
+        probability_min = float(
+            np.min(probabilities)
+        )
+
+        probability_max = float(
+            np.max(probabilities)
+        )
+
     else:
         probability_mean = None
         probability_min = None
@@ -157,13 +182,33 @@ def build_event(
         "decision_threshold": DECISION_THRESHOLD,
 
         "latency_ms": float(latency_ms),
+        "latency_per_row_ms": (
+            float(latency_per_row_ms)
+            if latency_per_row_ms is not None
+            else None
+        ),
+        "input_missing_ratio": (
+            float(input_missing_ratio)
+            if input_missing_ratio is not None
+            else None
+        ),
+        "output_positive_rate": (
+            float(output_positive_rate)
+            if output_positive_rate is not None
+            else None
+        ),
+
         "input_summary": input_summary,
 
-        "error_type": type(error).__name__ if error else None,
+        "error_type": (
+            type(error).__name__
+            if error else None
+        ),
         "error_message": (
             str(error)[:500]
             if error else None
         ),
+
         "created_by": None,
     }
 
@@ -273,25 +318,57 @@ def predict_from_csv(csv_file):
             encoding="utf-8-sig",
         )
 
+        # 1. Mesures techniques
         latency_ms = (
             time.perf_counter() - start_time
         ) * 1000
 
+        n_rows = len(X_input)
+
+        latency_per_row_ms = latency_ms / max(n_rows, 1)
+
+        input_missing_ratio = float(
+            X_input.isna().sum().sum() / X_input.size
+        )
+
+        output_positive_rate = float(
+            (predictions == 1).mean()
+        )
+
+
+        # 2. Construire l'événement principal
         event = build_event(
             request_id=request_id,
             status="success",
             latency_ms=latency_ms,
+            latency_per_row_ms=latency_per_row_ms,
+            input_missing_ratio=input_missing_ratio,
+            output_positive_rate=output_positive_rate,
             df_input=X_input,
             predictions=predictions,
             probabilities=probabilities,
         )
 
-        feature_stats = build_feature_statistics(
-            X_input,
-            request_id=request_id,
-        )
 
-        log_feature_statistics(feature_stats)
+        # 3. Insérer la ligne parent D'ABORD
+        log_prediction(event)
+
+
+        # 4. Construire les statistiques par feature
+        try:
+            feature_stats = build_feature_statistics(
+                X_input,
+                request_id=request_id,
+            )
+
+
+            # 5. Insérer les lignes enfant ENSUITE
+            log_feature_statistics(feature_stats)
+        except Exception:
+            logger.exception(
+                "request_id=%s feature_monitoring_logging_failed",
+                request_id,
+    )
 
         try:
             log_prediction(event)
