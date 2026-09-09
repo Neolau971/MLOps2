@@ -286,6 +286,56 @@ def save_drift_result(
         f"status={status}, share={share:.2%}"
     )
 
+def save_monitoring_result(
+    status: str,
+    observed_value: float,
+    details: dict,
+):
+    query = """
+    INSERT INTO monitoring_results (
+        check_type,
+        status,
+        model_name,
+        model_version,
+        observed_value,
+        warning_threshold,
+        critical_threshold,
+        details,
+        message
+    )
+    VALUES (
+        'data_drift',
+        %s,
+        %s,
+        %s,
+        %s,
+        %s,
+        %s,
+        %s::jsonb,
+        %s
+    );
+    """
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                (
+                    status,
+                    "random_forest_smote",
+                    "1.0.0",
+                    observed_value,
+                    0.10,
+                    0.25,
+                    json.dumps(details, default=str),
+                    (
+                        "Rapport Evidently généré. "
+                        f"{observed_value:.2%} des features "
+                        "sont signalées en dérive."
+                    ),
+                ),
+            )
+
 def main():
     reference_df = load_reference()
     current_df = load_current_data()
