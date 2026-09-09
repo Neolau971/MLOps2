@@ -5,3 +5,5 @@ scikit-learn==1.9.0
 imbalanced-learn==0.14.2
 numpy==2.4.6
 psycopg[binary]
+evidently==0.7.21
+pyarrow==25.0.1

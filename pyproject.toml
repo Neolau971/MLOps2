@@ -1,0 +1,12 @@
+[project]
+name = "mlops2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "evidently>=0.7.21",
+    "jupyterlab>=4.6.3",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.1",
+]

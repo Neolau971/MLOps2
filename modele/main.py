@@ -4,11 +4,12 @@ import logging
 import time
 import uuid
 import numpy as np
-from database import init_database, log_prediction
+from database import init_database, log_prediction, log_feature_statistics
 import joblib
 import pandas as pd
 import gradio as gr
 import os
+from monitoring import build_feature_statistics
 
 
 # ============================================================
@@ -31,6 +32,11 @@ MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
 DECISION_THRESHOLD = float(
     os.getenv("DECISION_THRESHOLD", "0.5")
 )
+
+MONITORING_DIR = PROJECT_ROOT / "monitoring_data"
+MONITORING_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_PRODUCTION_SAMPLE_ROWS = 1_000
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -231,6 +237,24 @@ def predict_from_csv(csv_file):
         # Colonnes dans l'ordre appris pendant l'entraînement
         X_input = df_input[EXPECTED_FEATURES].copy()
 
+        try:
+            sample_path = save_production_sample(
+                X_input,
+                request_id,
+            )
+
+            logger.info(
+                "request_id=%s monitoring_sample=%s",
+                request_id,
+                sample_path.name,
+            )
+
+        except Exception:
+            logger.exception(
+                "request_id=%s production_sample_save_failed",
+                request_id,
+            )
+
         probabilities = model.predict_proba(X_input)[:, 1]
 
         # Recommandé si tu as un seuil métier sauvegardé.
@@ -262,6 +286,13 @@ def predict_from_csv(csv_file):
             probabilities=probabilities,
         )
 
+        feature_stats = build_feature_statistics(
+            X_input,
+            request_id=request_id,
+        )
+
+        log_feature_statistics(feature_stats)
+
         try:
             log_prediction(event)
         except Exception:
@@ -288,9 +319,19 @@ def predict_from_csv(csv_file):
         return result_df.head(100), status, str(OUTPUT_PATH)
 
     except Exception as exc:
-        latency_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
+        latency_ms = (time.perf_counter() - start_time) * 1000
+
+        n_rows = len(X_input)
+
+        latency_per_row_ms = latency_ms / max(n_rows, 1)
+
+        missing_ratio = float(
+            X_input.isna().sum().sum() / X_input.size
+        )
+
+        positive_rate = float(
+            (predictions == 1).mean()
+        ) 
 
         event = build_event(
             request_id=request_id,
@@ -298,6 +339,9 @@ def predict_from_csv(csv_file):
             latency_ms=latency_ms,
             df_input=df_input,
             error=exc,
+            latency_per_row_ms=latency_per_row_ms,
+            input_missing_ratio=missing_ratio,
+            output_positive_rate=positive_rate,
         )
 
         try:
@@ -318,6 +362,41 @@ def predict_from_csv(csv_file):
             f"Identifiant de requête : {request_id}."
         )
 
+def save_production_sample(
+    X_input: pd.DataFrame,
+    request_id: str,
+) -> Path:
+    """
+    Sauvegarde un échantillon limité de données d'entrée.
+    À utiliser seulement si les données sont autorisées,
+    pseudonymisées et sans colonnes directement identifiantes.
+    """
+
+    sample_size = min(
+        MAX_PRODUCTION_SAMPLE_ROWS,
+        len(X_input),
+    )
+
+    sample_df = X_input.sample(
+        n=sample_size,
+        random_state=42,
+    ).copy()
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%SZ")
+
+    output_path = (
+        MONITORING_DIR
+        / f"production_{timestamp}_{request_id}.parquet"
+    )
+
+    sample_df.to_parquet(
+        output_path,
+        index=False,
+    )
+
+    return output_path
 
 # ============================================================
 # Interface Gradio

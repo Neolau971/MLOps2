@@ -93,6 +93,10 @@ def log_prediction(event: dict):
         decision_threshold,
 
         latency_ms,
+        latency_per_row_ms,
+        input_missing_ratio,
+        output_positive_rate,
+
         input_summary,
 
         error_type,
@@ -121,6 +125,10 @@ def log_prediction(event: dict):
         %(decision_threshold)s,
 
         %(latency_ms)s,
+        %(latency_per_row_ms)s,
+        %(input_missing_ratio)s,
+        %(output_positive_rate)s,
+
         %(input_summary)s::jsonb,
 
         %(error_type)s,
@@ -137,3 +145,39 @@ def log_prediction(event: dict):
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(query, event_to_insert)
+
+def log_feature_statistics(records: list[dict]):
+    query = """
+    INSERT INTO feature_monitoring_stats (
+        request_id,
+        feature_name,
+        feature_type,
+        n_values,
+        n_missing,
+        mean_value,
+        std_value,
+        min_value,
+        max_value,
+        category_counts,
+        histogram_counts,
+        histogram_edges
+    )
+    VALUES (
+        %(request_id)s,
+        %(feature_name)s,
+        %(feature_type)s,
+        %(n_values)s,
+        %(n_missing)s,
+        %(mean_value)s,
+        %(std_value)s,
+        %(min_value)s,
+        %(max_value)s,
+        %(category_counts)s::jsonb,
+        %(histogram_counts)s::jsonb,
+        %(histogram_edges)s::jsonb
+    );
+    """
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(query, records)

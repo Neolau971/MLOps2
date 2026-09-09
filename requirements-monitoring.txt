@@ -1,0 +1,5 @@
+evidently
+pandas
+numpy
+pyarrow==20.0.0
+psycopg[binary]
