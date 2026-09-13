@@ -28,7 +28,7 @@ def get_connection():
 
 
 def init_database():
-    query = """
+    prediction_logs_query = """
     CREATE TABLE IF NOT EXISTS prediction_logs (
         id BIGSERIAL PRIMARY KEY,
 
@@ -55,8 +55,12 @@ def init_database():
         decision_threshold DOUBLE PRECISION,
 
         latency_ms DOUBLE PRECISION NOT NULL,
+        latency_per_row_ms DOUBLE PRECISION,
+        input_missing_ratio DOUBLE PRECISION,
+        output_positive_rate DOUBLE PRECISION,
 
         input_summary JSONB,
+
         error_type VARCHAR(150),
         error_message TEXT,
 
@@ -64,9 +68,55 @@ def init_database():
     );
     """
 
+    feature_statistics_query = """
+    CREATE TABLE IF NOT EXISTS feature_monitoring_stats (
+        id BIGSERIAL PRIMARY KEY,
+
+        request_id UUID NOT NULL,
+
+        feature_name VARCHAR(255) NOT NULL,
+        feature_type VARCHAR(30) NOT NULL,
+
+        n_values INTEGER NOT NULL,
+        n_missing INTEGER NOT NULL,
+
+        mean_value DOUBLE PRECISION,
+        std_value DOUBLE PRECISION,
+        min_value DOUBLE PRECISION,
+        max_value DOUBLE PRECISION,
+
+        category_counts JSONB,
+        histogram_counts JSONB,
+        histogram_edges JSONB,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        CONSTRAINT feature_monitoring_stats_request_id_fkey
+            FOREIGN KEY (request_id)
+            REFERENCES prediction_logs(request_id)
+            ON DELETE CASCADE
+    );
+    """
+
+    indexes_query = """
+    CREATE INDEX IF NOT EXISTS idx_prediction_logs_created_at
+    ON prediction_logs(created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_prediction_logs_status
+    ON prediction_logs(status);
+
+    CREATE INDEX IF NOT EXISTS idx_feature_monitoring_stats_request_id
+    ON feature_monitoring_stats(request_id);
+
+    CREATE INDEX IF NOT EXISTS idx_feature_monitoring_stats_feature_name
+    ON feature_monitoring_stats(feature_name);
+    """
+
     with get_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(query)
+            cursor.execute(prediction_logs_query)
+            cursor.execute(feature_statistics_query)
+            cursor.execute(indexes_query)
 
 
 def log_prediction(event: dict):

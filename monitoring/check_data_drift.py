@@ -1,9 +1,11 @@
+import json
+import os
+import sys
+
+import psycopg
+from dotenv import load_dotenv
 from pathlib import Path
 from datetime import datetime, timezone
-import json
-import sys
-import os
-import psycopg
 
 import pandas as pd
 
@@ -24,6 +26,11 @@ REFERENCE_PATH = (
     / "reference_data.parquet"
 )
 
+MONITORING_FEATURES_PATH = (
+    ARTIFACTS_DIR
+    / "monitoring_features.json"
+)
+
 REPORTS_DIR.mkdir(
     parents=True,
     exist_ok=True,
@@ -33,6 +40,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 MODEL_NAME = "random_forest_smote"
 MODEL_VERSION = "1.0.0"
+
+MAX_REFERENCE_ROWS = 2_000
+MAX_CURRENT_ROWS = 2_000
+RANDOM_STATE = 42
 
 
 def load_reference() -> pd.DataFrame:
@@ -107,7 +118,30 @@ def build_report(
         current_data=current_df,
     )
 
-    result.save_html(report_path)
+    report_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    result.save_html(str(report_path))
+
+    if not report_path.exists():
+        raise RuntimeError(
+            "Evidently n'a pas créé le rapport HTML : "
+            f"{report_path}"
+        )
+
+    if report_path.stat().st_size == 0:
+        raise RuntimeError(
+            "Le rapport HTML généré est vide : "
+            f"{report_path}"
+        )
+
+    print(
+        "Rapport HTML Evidently créé : "
+        f"{report_path.resolve()} "
+        f"({report_path.stat().st_size / 1024:.1f} KiB)"
+    )
 
     return result
 
@@ -121,6 +155,24 @@ def get_nested_value(data: dict, *keys, default=None):
         current = current.get(key)
 
     return current if current is not None else default
+
+def sample_for_drift(
+    df: pd.DataFrame,
+    max_rows: int,
+    random_state: int = RANDOM_STATE,
+) -> pd.DataFrame:
+    """
+    Réduit la taille d'un dataset avant le calcul Evidently.
+    Ne modifie pas les données originales.
+    """
+
+    if len(df) <= max_rows:
+        return df.copy()
+
+    return df.sample(
+        n=max_rows,
+        random_state=random_state,
+    ).copy()
 
 def get_drift_summary(result) -> dict:
     """
@@ -345,6 +397,46 @@ def main():
         current_df,
     )
 
+    requested_features = load_monitoring_features()
+
+    available_features = [
+        feature
+        for feature in requested_features
+        if feature in reference_df.columns
+        and feature in current_df.columns
+    ]
+
+    unavailable_features = [
+        feature
+        for feature in requested_features
+        if feature not in available_features
+    ]
+
+    if not available_features:
+        raise ValueError(
+            "Aucune feature de monitoring n'est présente "
+            "dans la référence et les données de production."
+        )
+
+    if unavailable_features:
+        print(
+            "Features sélectionnées mais indisponibles : "
+            + ", ".join(unavailable_features)
+        )
+
+    reference_df = reference_df[
+        available_features
+    ].copy()
+
+    current_df = current_df[
+        available_features
+    ].copy()
+
+    print(
+        f"Drift analysé sur {len(available_features)} "
+        "features sélectionnées."
+    )
+
     timestamp = datetime.now(
         timezone.utc
     ).strftime("%Y%m%dT%H%M%SZ")
@@ -359,26 +451,41 @@ def main():
         / f"data_drift_report_{timestamp}.json"
     )
 
+    reference_rows_before_sampling = len(reference_df)
+    current_rows_before_sampling = len(current_df)
+
+    reference_df = sample_for_drift(
+        reference_df,
+        max_rows=MAX_REFERENCE_ROWS,
+    )
+
+    current_df = sample_for_drift(
+        current_df,
+        max_rows=MAX_CURRENT_ROWS,
+    )
+
+    print(
+        "Échantillons utilisés pour Evidently : "
+        f"reference={len(reference_df):,}/"
+        f"{reference_rows_before_sampling:,}, "
+        f"current={len(current_df):,}/"
+        f"{current_rows_before_sampling:,}"
+    )
+
     result = build_report(
         reference_df,
         current_df,
         report_path,
     )
 
-    summary = get_drift_summary(result)
+    print(
+    f"HTML existe : {report_path.exists()}"
+)
+    print(
+        f"Chemin HTML : {report_path.resolve()}"
+    )
 
-    with open(
-    json_path,
-    "w",
-    encoding="utf-8",
-    ) as file:
-        json.dump(
-            summary["raw"],
-            file,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
+    summary = get_drift_summary(result)
 
     save_drift_result(
         summary=summary,
@@ -411,6 +518,29 @@ def main():
         f"current rows={len(current_df)}"
     )
 
+def load_monitoring_features() -> list[str]:
+    if not MONITORING_FEATURES_PATH.exists():
+        raise FileNotFoundError(
+            "Fichier de sélection introuvable : "
+            f"{MONITORING_FEATURES_PATH}. "
+            "Exécute d'abord "
+            "monitoring/select_monitoring_features.py."
+        )
+
+    with MONITORING_FEATURES_PATH.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        payload = json.load(file)
+
+    features = payload.get("features", [])
+
+    if not features:
+        raise ValueError(
+            "La liste des features de monitoring est vide."
+        )
+
+    return features
 
 if __name__ == "__main__":
     try:

@@ -4,12 +4,16 @@ import logging
 import time
 import uuid
 import numpy as np
-from database import init_database, log_prediction, log_feature_statistics
+from .database import (
+    init_database,
+    log_prediction,
+    log_feature_statistics,
+)
 import joblib
 import pandas as pd
 import gradio as gr
 import os
-from monitoring import build_feature_statistics
+from .monitoring import build_feature_statistics
 from datetime import datetime, timezone
 import json
 
@@ -34,6 +38,10 @@ DECISION_THRESHOLD = float(
     os.getenv("DECISION_THRESHOLD", "0.5")
 )
 
+MODEL_N_JOBS = int(
+    os.getenv("MODEL_N_JOBS", "2")
+)
+
 MONITORING_DIR = PROJECT_ROOT / "monitoring_data"
 MONITORING_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -47,6 +55,60 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_random_forest(
+    loaded_model,
+):
+    """
+    Retourne le Random Forest, qu'il soit directement sérialisé
+    ou placé dans une étape nommée 'model' d'un pipeline.
+    """
+
+    if hasattr(
+        loaded_model,
+        "feature_importances_",
+    ):
+        return loaded_model
+
+    if hasattr(loaded_model, "named_steps"):
+        random_forest = loaded_model.named_steps.get(
+            "model"
+        )
+
+        if (
+            random_forest is not None
+            and hasattr(random_forest, "n_jobs")
+        ):
+            return random_forest
+
+    raise AttributeError(
+        "Impossible de trouver un Random Forest "
+        "configurable dans le modèle chargé."
+    )
+
+
+def configure_model_parallelism(
+    loaded_model,
+    n_jobs: int,
+) -> None:
+    """
+    Configure le nombre de workers utilisés par le Random Forest
+    sans modifier ses arbres ni le réentraîner.
+    """
+
+    random_forest = get_random_forest(
+        loaded_model
+    )
+
+    previous_n_jobs = random_forest.n_jobs
+
+    random_forest.n_jobs = n_jobs
+
+    logger.info(
+        "Random Forest n_jobs configuré : %s -> %s",
+        previous_n_jobs,
+        n_jobs,
+    )
+
 # ============================================================
 # Chargement du modèle
 # ============================================================
@@ -58,7 +120,19 @@ if not MODEL_PATH.exists():
 
 model = joblib.load(MODEL_PATH)
 
+configure_model_parallelism(
+    model,
+    MODEL_N_JOBS,
+)
+
 print(f"Modèle chargé depuis : {MODEL_PATH}")
+
+logger.info(
+    "Configuration modèle : "
+    "decision_threshold=%s, n_jobs=%s",
+    DECISION_THRESHOLD,
+    MODEL_N_JOBS,
+)
 
 
 # ============================================================
@@ -243,6 +317,79 @@ EXPECTED_FEATURES = get_expected_features(model)
 
 print(f"Nombre de features attendues : {len(EXPECTED_FEATURES)}")
 
+def predict_dataframe(
+    input_df: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Effectue la validation et la prédiction à partir d'un DataFrame.
+
+    Retourne :
+    - result_df : données d'entrée avec prediction et probabilite_defaut
+    - X_input : données transmises au modèle, dans l'ordre attendu
+    - predictions : classes prédites, 0 ou 1
+    - probabilities : probabilités de défaut
+    """
+
+    if input_df is None or input_df.empty:
+        raise ValueError(
+            "Le fichier CSV ne contient aucune ligne."
+        )
+
+    # Ne jamais modifier le DataFrame fourni par l'appelant.
+    df_input = input_df.copy()
+
+    # Le target peut exister dans un fichier de test,
+    # mais il ne doit jamais être transmis au modèle.
+    df_input = df_input.drop(
+        columns=["TARGET"],
+        errors="ignore",
+    )
+
+    missing_features = [
+        feature
+        for feature in EXPECTED_FEATURES
+        if feature not in df_input.columns
+    ]
+
+    if missing_features:
+        preview = ", ".join(missing_features[:10])
+
+        raise ValueError(
+            f"{len(missing_features)} features manquantes : "
+            f"{preview}"
+        )
+
+    # Écarte les colonnes supplémentaires et garantit
+    # le même ordre que pendant l'entraînement.
+    X_input = df_input[
+        EXPECTED_FEATURES
+    ].copy()
+
+    probabilities = model.predict_proba(
+        X_input
+    )[:, 1]
+
+    predictions = (
+        probabilities >= DECISION_THRESHOLD
+    ).astype(int)
+
+    result_df = df_input.copy()
+    result_df["prediction"] = predictions
+    result_df["probabilite_defaut"] = (
+        probabilities.round(4)
+    )
+
+    return (
+        result_df,
+        X_input,
+        predictions,
+        probabilities,
+    )
 
 # ============================================================
 # Prédiction depuis un CSV
@@ -251,36 +398,26 @@ print(f"Nombre de features attendues : {len(EXPECTED_FEATURES)}")
 def predict_from_csv(csv_file):
     request_id = str(uuid.uuid4())
     start_time = time.perf_counter()
+
     df_input = None
+    X_input = None
+    predictions = None
+    probabilities = None
 
     try:
         if csv_file is None:
-            raise ValueError("Aucun fichier CSV fourni.")
+            raise ValueError(
+                "Aucun fichier CSV fourni."
+            )
 
         df_input = pd.read_csv(csv_file)
 
-        # Si TARGET est présent, il n'est pas transmis au modèle
-        df_input = df_input.drop(
-            columns=["TARGET"],
-            errors="ignore",
-        )
-
-        missing_features = [
-            feature
-            for feature in EXPECTED_FEATURES
-            if feature not in df_input.columns
-        ]
-
-        if missing_features:
-            preview = ", ".join(missing_features[:10])
-
-            raise ValueError(
-                f"{len(missing_features)} features manquantes : "
-                f"{preview}"
-            )
-
-        # Colonnes dans l'ordre appris pendant l'entraînement
-        X_input = df_input[EXPECTED_FEATURES].copy()
+        (
+            result_df,
+            X_input,
+            predictions,
+            probabilities,
+        ) = predict_dataframe(df_input)
 
         try:
             sample_path = save_production_sample(
@@ -300,43 +437,36 @@ def predict_from_csv(csv_file):
                 request_id,
             )
 
-        probabilities = model.predict_proba(X_input)[:, 1]
+        OUTPUT_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        # Recommandé si tu as un seuil métier sauvegardé.
-        predictions = (
-            probabilities >= DECISION_THRESHOLD
-        ).astype(int)
-
-        result_df = df_input.copy()
-        result_df["prediction"] = predictions
-        result_df["probabilite_defaut"] = probabilities.round(4)
-
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         result_df.to_csv(
             OUTPUT_PATH,
             index=False,
             encoding="utf-8-sig",
         )
 
-        # 1. Mesures techniques
         latency_ms = (
             time.perf_counter() - start_time
         ) * 1000
 
         n_rows = len(X_input)
 
-        latency_per_row_ms = latency_ms / max(n_rows, 1)
+        latency_per_row_ms = (
+            latency_ms / max(n_rows, 1)
+        )
 
         input_missing_ratio = float(
-            X_input.isna().sum().sum() / X_input.size
+            X_input.isna().sum().sum()
+            / X_input.size
         )
 
         output_positive_rate = float(
             (predictions == 1).mean()
         )
 
-
-        # 2. Construire l'événement principal
         event = build_event(
             request_id=request_id,
             status="success",
@@ -349,34 +479,30 @@ def predict_from_csv(csv_file):
             probabilities=probabilities,
         )
 
+        # Une seule insertion dans prediction_logs.
+        # Elle doit précéder les statistiques enfant.
+        try:
+            log_prediction(event)
 
-        # 3. Insérer la ligne parent D'ABORD
-        log_prediction(event)
+        except Exception:
+            logger.exception(
+                "request_id=%s database_logging_failed",
+                request_id,
+            )
 
-
-        # 4. Construire les statistiques par feature
+        # Les statistiques sont facultatives pour la réponse API.
+        # Elles ne doivent pas casser la prédiction utilisateur.
         try:
             feature_stats = build_feature_statistics(
                 X_input,
                 request_id=request_id,
             )
 
-
-            # 5. Insérer les lignes enfant ENSUITE
             log_feature_statistics(feature_stats)
+
         except Exception:
             logger.exception(
                 "request_id=%s feature_monitoring_logging_failed",
-                request_id,
-    )
-
-        try:
-            log_prediction(event)
-        except Exception:
-            # La prédiction ne doit pas échouer seulement
-            # parce que le logging est indisponible.
-            logger.exception(
-                "request_id=%s database_logging_failed",
                 request_id,
             )
 
@@ -393,36 +519,66 @@ def predict_from_csv(csv_file):
             f"Temps : {latency_ms:.2f} ms."
         )
 
-        return result_df.head(100), status, str(OUTPUT_PATH)
-
-    except Exception as exc:
-        latency_ms = (time.perf_counter() - start_time) * 1000
-
-        n_rows = len(X_input)
-
-        latency_per_row_ms = latency_ms / max(n_rows, 1)
-
-        missing_ratio = float(
-            X_input.isna().sum().sum() / X_input.size
+        return (
+            result_df.head(100),
+            status,
+            str(OUTPUT_PATH),
         )
 
-        positive_rate = float(
-            (predictions == 1).mean()
-        ) 
+    except Exception as exc:
+        latency_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        # Ces valeurs doivent rester sûres même si l'erreur
+        # arrive avant la construction de X_input ou predictions.
+        n_rows = (
+            len(X_input)
+            if X_input is not None
+            else (
+                len(df_input)
+                if df_input is not None
+                else 0
+            )
+        )
+
+        latency_per_row_ms = (
+            latency_ms / max(n_rows, 1)
+        )
+
+        input_missing_ratio = None
+
+        if X_input is not None and X_input.size > 0:
+            input_missing_ratio = float(
+                X_input.isna().sum().sum()
+                / X_input.size
+            )
+
+        output_positive_rate = None
+
+        if predictions is not None and len(predictions) > 0:
+            output_positive_rate = float(
+                (predictions == 1).mean()
+            )
 
         event = build_event(
             request_id=request_id,
             status="error",
             latency_ms=latency_ms,
-            df_input=df_input,
-            error=exc,
             latency_per_row_ms=latency_per_row_ms,
-            input_missing_ratio=missing_ratio,
-            output_positive_rate=positive_rate,
+            input_missing_ratio=input_missing_ratio,
+            output_positive_rate=output_positive_rate,
+            df_input=X_input
+            if X_input is not None
+            else df_input,
+            predictions=predictions,
+            probabilities=probabilities,
+            error=exc,
         )
 
         try:
             log_prediction(event)
+
         except Exception:
             logger.exception(
                 "request_id=%s error_logging_failed",
@@ -435,7 +591,7 @@ def predict_from_csv(csv_file):
         )
 
         raise gr.Error(
-            f"Erreur de prédiction. "
+            "Erreur de prédiction. "
             f"Identifiant de requête : {request_id}."
         )
 
@@ -474,6 +630,8 @@ def save_production_sample(
     )
 
     return output_path
+
+
 
 # ============================================================
 # Interface Gradio
