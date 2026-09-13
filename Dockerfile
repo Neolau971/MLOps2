@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["python", "modele/main.py"]
+CMD ["python", "-m", "modele.main"]
