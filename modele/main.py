@@ -15,7 +15,6 @@ import gradio as gr
 import os
 from .monitoring import build_feature_statistics
 from datetime import datetime, timezone
-import json
 
 # ============================================================
 # Chemins du projet
@@ -35,7 +34,7 @@ OUTPUT_PATH = OUTPUT_DIR / "predictions_credit_scoring.csv"
 MODEL_NAME = "random_forest_smote"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
 DECISION_THRESHOLD = float(
-    os.getenv("DECISION_THRESHOLD", "0.5")
+    os.getenv("DECISION_THRESHOLD", "0.1")
 )
 
 MODEL_N_JOBS = int(
@@ -54,6 +53,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# definition des fonctions principals
+# ============================================================
 
 def get_random_forest(
     loaded_model,
@@ -675,6 +677,11 @@ with gr.Blocks(title="Credit Scoring - Prédictions CSV") as demo:
             status_output,
             download_output,
         ],
+        api_description=(
+            "Télécharge un CSV contenant 706 features attendus pour le model."
+            "Renvoie un extrait, un message de status, "
+            "et un CSV télécgargeable contenant les predictions."
+        ),
     )
 
 
