@@ -30,6 +30,11 @@ MODEL_PATH = (
 
 OUTPUT_DIR = PROJECT_ROOT / "data"
 OUTPUT_PATH = OUTPUT_DIR / "predictions_credit_scoring.csv"
+RESULT_COLUMNS = [
+    "SK_ID_CURR",
+    "prediction",
+    "probabilite_defaut",
+]
 
 MODEL_NAME = "random_forest_smote"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
@@ -444,7 +449,23 @@ def predict_from_csv(csv_file):
             exist_ok=True,
         )
 
-        result_df.to_csv(
+        available_result_columns = [
+            column
+            for column in RESULT_COLUMNS
+            if column in result_df.columns
+        ]
+
+        if not available_result_columns:
+            available_result_columns = [
+                "prediction",
+                "probabilite_defaut",
+            ]
+
+        download_df = result_df[
+            available_result_columns
+        ].copy()
+
+        download_df.to_csv(
             OUTPUT_PATH,
             index=False,
             encoding="utf-8-sig",
